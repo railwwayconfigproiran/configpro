@@ -1141,6 +1141,112 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
                 }
     return {"ok": True}
 
+
+
+@app.post("/api/links/custom")
+@limiter.limit("5/minute")
+async def create_link_custom(request: Request, _=Depends(require_auth)):
+    """Create an inbound from a custom VLESS config URL.
+    
+    Supports:
+    - config_url: Full VLESS config URL with all parameters
+    - limit_value: Outbound bandwidth limit (default 0 = unlimited)
+    - limit_unit: Unit for limit (default GB)
+    - days_valid: Expiry in days (default 0 = unlimited)
+    """
+    body = await request.json()
+    config_url = body.get("config_url", "").strip()
+    if not config_url:
+        raise HTTPException(status_code=400, detail="config_url is required")
+
+    label = (body.get("label") or "Custom Config").strip()[:60]
+    limit_value = float(body.get("limit_value", 0) or 0)
+    limit_unit = body.get("limit_unit", "GB") or "GB"
+    days_valid = body.get("days_valid", 0) or 0
+
+    # Parse the config URL to extract all parameters
+    parsed = parse_config_url(config_url)
+
+    # Determine the outbound limit in bytes
+    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+
+    # Determine expiry
+    expires_at = None
+    try:
+        days_valid = int(days_valid)
+        if days_valid > 0:
+            expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
+    except (ValueError, TypeError):
+        pass
+
+    # Extract the fragment as remark (what is after # in config URL)
+    remark = parsed.get("fragment", "")
+    if not remark:
+        # Use the host from the config URL as remark
+        remark = parsed.get("host", "")
+
+    # Build extra params from the config URL
+    extra = {
+        "custom_path": parsed.get("path", ""),
+        "custom_sni": parsed.get("sni", ""),
+        "custom_host": parsed.get("host", ""),
+        "custom_fp": parsed.get("fp", "chrome"),
+        "fragment": remark,
+    }
+
+    # Generate the VLESS link from config URL
+    uid = str(uuid_lib.uuid4())
+    link_data = {
+        "uid": uid,
+        "label": label,
+        "limit_bytes": limit_bytes,
+        "used_bytes": 0,
+        "max_connections": int(body.get("max_connections", 0) or 0),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "active": 1,
+        "expires_at": expires_at,
+        "custom_path": extra["custom_path"],
+        "custom_sni": extra["custom_sni"],
+        "custom_host": extra["custom_host"],
+        "custom_fp": extra["custom_fp"],
+        "color": body.get("color", "#39ff14"),
+        "flag": body.get("flag", ""),
+        "fragment": extra["fragment"],
+    }
+
+    async with LINKS_LOCK:
+        LINKS[uid] = link_data
+
+    # Also store the full config_url in the link
+    link_data["config_url"] = config_url
+
+    await db_execute(
+        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+        (uid, label, limit_bytes, int(body.get("max_connections", 0) or 0), datetime.now(timezone.utc).isoformat(), 1, expires_at, extra.get("custom_path", ""), extra.get("custom_sni", ""), extra.get("custom_host", ""), extra.get("custom_fp", "chrome"), body.get("color", "#39ff14"), extra.get("flag", ""), extra.get("fragment", "")),
+    )
+
+    # Generate the VLESS link from the config URL
+    vless_link = generate_vless_link_from_config(config_url, uid, remark=remark, extra=extra)
+
+    log_event("Inbound", f"Created inbound from custom config: {label} ({uid})")
+    return {
+        "uuid": uid,
+        "label": label,
+        "limit_bytes": limit_bytes,
+        "used_bytes": 0,
+        "max_connections": int(body.get("max_connections", 0) or 0),
+        "active": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": expires_at,
+        "color": body.get("color", "#39ff14"),
+        "flag": extra.get("flag", ""),
+        "fragment": extra.get("fragment", ""),
+        "vless_link": vless_link,
+        "config_url": config_url,
+    }
+
+
 # ═══ INBOUNDS ═══
 
 @app.post("/api/links")
@@ -2305,6 +2411,7 @@ textarea.fi{resize:vertical;min-height:90px;}
         <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="Manage VLESS Configs" data-fa="مدیریت کانفیگ‌های VLESS">Manage VLESS Configs</div></div>
         <div style="display:flex;gap:6px;">
           <button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
+          <button class="btn btn-outline btn-sm" onclick="showCustomMo()" data-en="Custom Config" data-fa="کانفیگ سفارشی">Custom Config</button>
           <button class="btn btn-outline btn-sm" onclick="exportLinks()" data-en="Export" data-fa="خروجی">Export</button>
           <button class="btn btn-outline btn-sm" onclick="document.getElementById('import-file').click()" data-en="Import" data-fa="ورودی">Import</button>
           <input type="file" id="import-file" style="display:none" accept=".json" onchange="importLinks(this)">
@@ -2530,6 +2637,33 @@ example.com
     </div>
   </footer>
 </div>
+
+    <div class="mo" id="mo-custom">
+      <div class="mo-box">
+        <button class="mo-close" onclick="document.getElementById('mo-custom').classList.remove('show')">✕</button>
+        <div class="mo-title" data-en="Custom Config" data-fa="کانفیگ سفارشی">Custom Config</div>
+        <div class="fg">
+          <label class="fl" data-en="VLESS Config URL" data-fa="آدرس کانفیگ VLESS">VLESS Config URL</label>
+          <textarea class="fi" id="custom-config-url" placeholder="vless://..." style="min-height:80px; resize:vertical; font-family:monospace; font-size:0.8rem;"></textarea>
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="Label" data-fa="برچسب">Label</label>
+          <input class="fi" id="custom-label" placeholder="Custom Config">
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="Data Limit (GB)" data-fa="محدودیت داده (گیگ)">Data Limit (GB)</label>
+          <input class="fi" id="custom-limit" type="number" min="0" value="10" placeholder="e.g. 10 for 10GB">
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="Expiry (days)" data-fa="انقضا (روز)">Expiry (days)</label>
+          <input class="fi" id="custom-days" type="number" min="0" value="0" placeholder="0 = unlimited">
+        </div>
+        <div style="display:flex;gap:6px;margin-top:10px;">
+          <button class="btn btn-primary" style="flex:1;" data-en="Create" data-fa="ایجاد" onclick="createCustomLink()">Create</button>
+          <button class="btn btn-outline" style="flex:1;" data-en="Cancel" data-fa="انصراف" onclick="document.getElementById('mo-custom').classList.remove('show')">Cancel</button>
+        </div>
+      </div>
+    </div>
 
 <div class="mo" id="mo-add">
   <div class="mo-box">
@@ -3026,6 +3160,34 @@ function sortLinks(col){if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';el
 async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast('Failed',true);}}
 async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
 function showAddMo(){$m('mo-add').classList.add('show');}
+function showCustomMo(){$m('mo-custom').classList.add('show');}
+async function createCustomLink(){
+  const configUrl=$m('custom-config-url').value.trim();
+  if(!configUrl){toast('Config URL is required',true);return;}
+  const label=$m('custom-label').value.trim()||'Custom Config';
+  const limit=parseFloat($m('custom-limit').value)||0;
+  const days=parseInt($m('custom-days').value)||0;
+  const body={
+    config_url:configUrl,
+    label:label,
+    limit_value:limit,
+    limit_unit:'GB',
+    max_connections:0
+  };
+  if(days>0)body.days_valid=days;
+  try{
+    const r=await fetch('/api/links/custom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(r.ok){
+      const d=await r.json();
+      toast('Created: '+d.uuid);
+      $m('mo-custom').classList.remove('show');
+      loadLinks();loadStats();
+    }else{
+      const d=await r.json();
+      toast(d.detail||'Error',true);
+    }
+  }catch{toast('Error',true);}
+}
 async function createLink(){
   const label=$m('nl').value.trim()||'This Server is Free';
   const uuid=$m('auuid').value.trim();
