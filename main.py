@@ -465,6 +465,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_keepalive_advanced_loop())
     asyncio.create_task(cleanup_idle_connections())
     asyncio.create_task(telegram_reporter())
+    asyncio.create_task(telegram_bot_poller())
     asyncio.create_task(flush_traffic_buffer())
     asyncio.create_task(sync_usage_to_db())
     asyncio.create_task(auto_disable_expired_links())
@@ -791,6 +792,153 @@ async def telegram_reporter():
                     await client.post(url, json={"chat_id": chat_row["value"], "text": msg})
         except Exception:
             pass
+
+
+async def telegram_bot_poller():
+    """Background task that polls Telegram for bot commands and processes them.
+    This is for self-hosted panels where webhook URL setup is not possible.
+    """
+    update_offset = 0
+    while True:
+        try:
+            token_row = await db_fetchone(
+                "SELECT value FROM settings WHERE key = 'tg_bot_token'",
+                "SELECT value FROM settings WHERE key = 'tg_bot_token'"
+            )
+            if not token_row or not token_row["value"]:
+                await asyncio.sleep(10)
+                continue
+
+            allowed_chat_row = await db_fetchone(
+                "SELECT value FROM settings WHERE key = 'tg_chat_id'",
+                "SELECT value FROM settings WHERE key = 'tg_chat_id'"
+            )
+            allowed_chat = allowed_chat_row["value"] if allowed_chat_row and allowed_chat_row["value"] else None
+
+            url = f"https://api.telegram.org/bot{token_row['value']}/getUpdates"
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url, params={"offset": update_offset, "timeout": 30})
+                data = resp.json()
+
+            if not data.get("ok") or not data.get("result"):
+                await asyncio.sleep(5)
+                continue
+
+            for update in data["result"]:
+                update_offset = update["update_id"] + 1
+
+                message = update.get("message", {})
+                text = message.get("text", "")
+                chat_id = message.get("chat", {}).get("id", "")
+
+                if not text:
+                    continue
+
+                # Only process messages from allowed chat
+                if allowed_chat and str(allowed_chat) != str(chat_id):
+                    continue
+
+                # Parse command
+                parts = text.strip().split(" ")
+                command = parts[0].lower()
+
+                response_text = ""
+
+                if command == "/list" or command == "/start" or command == "/help":
+                    async with LINKS_LOCK:
+                        items = list(LINKS.values())
+
+                    if command in ("/start", "/help"):
+                        response_text = (
+                            "🤖 SulgX Panel Bot\n"
+                            "Commands:\n"
+                            "/list - List all inbounds\n"
+                            "/enable <uid> - Enable an inbound\n"
+                            "/disable <uid> - Disable an inbound\n"
+                            "/delete <uid> - Delete an inbound\n"
+                            "/stats - Show panel stats"
+                        )
+                    else:
+                        response_text = "📋 Inbounds:\n"
+                        for item in items:
+                            status = "✅" if item.get("active") else "❌"
+                            limit = item.get("limit_bytes", 0)
+                            used = item.get("used_bytes", 0)
+                            limit_str = "∞" if limit == 0 else f"{used/(1024**3):.1f}/{limit/(1024**3):.1f}GB"
+                            response_text += f"{status} {item.get('label','')} [{item['uid'][:8]}] - {limit_str}\n"
+
+                elif command == "/enable" and len(parts) > 1:
+                    uid = parts[1]
+                    async with LINKS_LOCK:
+                        if uid in LINKS:
+                            LINKS[uid]["active"] = 1
+                            await db_execute(
+                                "UPDATE links SET active = 1 WHERE uid = ?",
+                                "UPDATE links SET active = TRUE WHERE uid = $1",
+                                (uid,)
+                            )
+                            response_text = f"✅ Enabled: {uid}"
+                        else:
+                            response_text = f"❌ Not found: {uid}"
+
+                elif command == "/disable" and len(parts) > 1:
+                    uid = parts[1]
+                    async with LINKS_LOCK:
+                        if uid in LINKS:
+                            LINKS[uid]["active"] = 0
+                            await db_execute(
+                                "UPDATE links SET active = 0 WHERE uid = ?",
+                                "UPDATE links SET active = FALSE WHERE uid = $1",
+                                (uid,)
+                            )
+                            await close_connections_for_link(uid)
+                            response_text = f"✅ Disabled: {uid}"
+                        else:
+                            response_text = f"❌ Not found: {uid}"
+
+                elif command == "/delete" and len(parts) > 1:
+                    uid = parts[1]
+                    async with LINKS_LOCK:
+                        if uid in LINKS and LINKS[uid].get("label") != "This Server is Free":
+                            await db_execute(
+                                "DELETE FROM links WHERE uid = ?",
+                                "DELETE FROM links WHERE uid = $1",
+                                (uid,)
+                            )
+                            LINKS.pop(uid, None)
+                            await close_connections_for_link(uid)
+                            response_text = f"✅ Deleted: {uid}"
+                        else:
+                            response_text = f"❌ Cannot delete: {uid}"
+
+                elif command == "/stats":
+                    response_text = (
+                        f"📊 SulgX Panel Stats\n"
+                        f"🕒 Uptime: {uptime()}\n"
+                        f"🔗 Conns: {len(connections)}\n"
+                        f"📦 Traffic: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
+                        f"📡 Requests: {stats['total_requests']}\n"
+                        f"❌ Errors: {stats['total_errors']}"
+                    )
+
+                else:
+                    response_text = "❌ Unknown command\nUse /help for available commands"
+
+                # Send response
+                if response_text:
+                    send_url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
+                    try:
+                        async with httpx.AsyncClient(timeout=10.0) as client2:
+                            await client2.post(send_url, json={"chat_id": chat_id, "text": response_text})
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            logger.error(f"telegram_bot_poller error: {e}", exc_info=True)
+            await asyncio.sleep(10)
+
+        await asyncio.sleep(2)  # Poll every 2 seconds
+
 
 def get_domain() -> str:
     domain = (
