@@ -796,6 +796,7 @@ async def telegram_reporter():
 
 async def telegram_bot_poller():
     """Background task that polls Telegram for bot commands and processes them.
+    Supports Persian (Farsi) language interface.
     This is for self-hosted panels where webhook URL setup is not possible.
     """
     update_offset = 0
@@ -814,6 +815,13 @@ async def telegram_bot_poller():
                 "SELECT value FROM settings WHERE key = 'tg_chat_id'"
             )
             allowed_chat = allowed_chat_row["value"] if allowed_chat_row and allowed_chat_row["value"] else None
+
+            # Check language preference
+            lang_row = await db_fetchone(
+                "SELECT value FROM settings WHERE key = 'telegram_lang'",
+                "SELECT value FROM settings WHERE key = 'telegram_lang'"
+            )
+            lang = 'fa' if lang_row and lang_row["value"] == 'fa' else 'en'
 
             url = f"https://api.telegram.org/bot{token_row['value']}/getUpdates"
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -844,28 +852,138 @@ async def telegram_bot_poller():
 
                 response_text = ""
 
-                if command == "/list" or command == "/start" or command == "/help":
+                if command in ("/list", "/start", "/help", "/help_fa", "/help_en"):
                     async with LINKS_LOCK:
                         items = list(LINKS.values())
 
-                    if command in ("/start", "/help"):
-                        response_text = (
-                            "🤖 SulgX Panel Bot\n"
-                            "Commands:\n"
-                            "/list - List all inbounds\n"
-                            "/enable <uid> - Enable an inbound\n"
-                            "/disable <uid> - Disable an inbound\n"
-                            "/delete <uid> - Delete an inbound\n"
-                            "/stats - Show panel stats"
-                        )
-                    else:
-                        response_text = "📋 Inbounds:\n"
+                    if command == "/start" or command.startswith("/help"):
+                        if lang == 'fa':
+                            response_text = (
+                                "🤖 به پنل SulgX خوش آمدید\n"
+                                "دستورات موجود:\n"
+                                "/list - نمایش تمام اینباندها\n"
+                                "/enable <uid> - فعال کردن اینباند\n"
+                                "/disable <uid> - غیرفعال کردن اینباند\n"
+                                "/delete <uid> - حذف اینباند\n"
+                                "/create <label> <limit_gb> <days> <config_url> - ساخت اینباند جدید\n"
+                                "/stats - نمایش آمار سرور\n"
+                                "/help - نمایش این راهنما\n"
+                                "\n برای مثال:\n"
+                                "/create MyConfig 10 30 vless://uuid@server:port?params#remark"
+                            )
+                        else:
+                            response_text = (
+                                "🤖 Welcome to SulgX Panel Bot\n"
+                                "Available commands:\n"
+                                "/list - List all inbounds\n"
+                                "/enable <uid> - Enable an inbound\n"
+                                "/disable <uid> - Disable an inbound\n"
+                                "/delete <uid> - Delete an inbound\n"
+                                "/create <label> <limit_gb> <days> <config_url> - Create new inbound\n"
+                                "/stats - Show panel stats\n"
+                                "/help - Show this help"
+                            )
+                    elif command == "/list":
+                        if lang == 'fa':
+                            response_text = "📋 اینباندها:\n"
+                        else:
+                            response_text = "📋 Inbounds:\n"
                         for item in items:
                             status = "✅" if item.get("active") else "❌"
                             limit = item.get("limit_bytes", 0)
                             used = item.get("used_bytes", 0)
                             limit_str = "∞" if limit == 0 else f"{used/(1024**3):.1f}/{limit/(1024**3):.1f}GB"
-                            response_text += f"{status} {item.get('label','')} [{item['uid'][:8]}] - {limit_str}\n"
+                            uid_short = item['uid'][:8]
+                            response_text += f"{status} {item.get('label','')} [{uid_short}] - {limit_str}\n"
+
+                elif command == "/create" and len(parts) > 4:
+                    # Format: /create <label> <limit_gb> <days> <config_url>
+                    label = parts[1]
+                    try:
+                        limit_gb = float(parts[2])
+                    except ValueError:
+                        if lang == 'fa':
+                            response_text = "❌ مقدار limit_gb باید عدد باشد"
+                        else:
+                            response_text = "❌ limit_gb must be a number"
+                        continue
+                    try:
+                        days = int(parts[3])
+                    except ValueError:
+                        if lang == 'fa':
+                            response_text = "❌ مقدار days باید عدد باشد"
+                        else:
+                            response_text = "❌ days must be a number"
+                        continue
+
+                    config_url = " ".join(parts[4:])  # Config URL may contain spaces if not properly formatted
+
+                    # Validate config URL
+                    if not config_url.startswith("vless://"):
+                        if lang == 'fa':
+                            response_text = "❌ آدرس config_url باید با vless:// شروع شود"
+                        else:
+                            response_text = "❌ config_url must start with vless://"
+                        continue
+
+                    # Create the inbound
+                    uid = str(uuid_lib.uuid4())
+                    limit_bytes = 0 if limit_gb <= 0 else parse_size_to_bytes(limit_gb, "GB")
+                    
+                    expires_at = None
+                    if days > 0:
+                        expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+                    parsed = parse_config_url(config_url)
+                    remark = parsed.get("fragment", "")
+                    
+                    extra = {
+                        "custom_path": parsed.get("path", ""),
+                        "custom_sni": parsed.get("sni", ""),
+                        "custom_host": parsed.get("host", ""),
+                        "custom_fp": parsed.get("fp", "chrome"),
+                        "fragment": remark,
+                    }
+
+                    link_data = {
+                        "uid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
+                        "max_connections": 0, "created_at": datetime.now(timezone.utc).isoformat(),
+                        "active": 1, "expires_at": expires_at,
+                        "custom_path": extra["custom_path"], "custom_sni": extra["custom_sni"],
+                        "custom_host": extra["custom_host"], "custom_fp": extra["custom_fp"],
+                        "color": "#39ff14", "flag": "", "fragment": extra["fragment"],
+                        "config_url": config_url,
+                    }
+
+                    async with LINKS_LOCK:
+                        LINKS[uid] = link_data
+
+                    await db_execute(
+                        "INSERT INTO links (uid, label, limit_bytes, limit_bytes_outbound, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, config_url) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO links (uid, label, limit_bytes, limit_bytes_outbound, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, config_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+                        (uid, label, limit_bytes, limit_bytes, 0, datetime.now(timezone.utc).isoformat(), 1, expires_at, extra.get("custom_path", ""), extra.get("custom_sni", ""), extra.get("custom_host", ""), extra.get("custom_fp", "chrome"), "#39ff14", "", extra.get("fragment", ""), config_url),
+                    )
+
+                    vless_link = generate_vless_link_from_config(config_url, uid, remark=remark, extra=extra)
+                    
+                    if lang == 'fa':
+                        response_text = (
+                            f"✅ اینباند ساخته شد:\n"
+                            f"📱 لیبل: {label}\n"
+                            f"🆔 UID: {uid}\n"
+                            f"💾 لیمیت: {limit_gb} GB\n"
+                            f"⏰ انقضا: {days} روز\n"
+                            f"🔗 VLESS:\n{vless_link}"
+                        )
+                    else:
+                        response_text = (
+                            f"✅ Inbound created:\n"
+                            f"📱 Label: {label}\n"
+                            f"🆔 UID: {uid}\n"
+                            f"💾 Limit: {limit_gb} GB\n"
+                            f"⏰ Expiry: {days} days\n"
+                            f"🔗 VLESS:\n{vless_link}"
+                        )
 
                 elif command == "/enable" and len(parts) > 1:
                     uid = parts[1]
@@ -879,7 +997,10 @@ async def telegram_bot_poller():
                             )
                             response_text = f"✅ Enabled: {uid}"
                         else:
-                            response_text = f"❌ Not found: {uid}"
+                            if lang == 'fa':
+                                response_text = f"❌ یافت نشد: {uid}"
+                            else:
+                                response_text = f"❌ Not found: {uid}"
 
                 elif command == "/disable" and len(parts) > 1:
                     uid = parts[1]
@@ -894,7 +1015,10 @@ async def telegram_bot_poller():
                             await close_connections_for_link(uid)
                             response_text = f"✅ Disabled: {uid}"
                         else:
-                            response_text = f"❌ Not found: {uid}"
+                            if lang == 'fa':
+                                response_text = f"❌ یافت نشد: {uid}"
+                            else:
+                                response_text = f"❌ Not found: {uid}"
 
                 elif command == "/delete" and len(parts) > 1:
                     uid = parts[1]
@@ -907,22 +1031,59 @@ async def telegram_bot_poller():
                             )
                             LINKS.pop(uid, None)
                             await close_connections_for_link(uid)
-                            response_text = f"✅ Deleted: {uid}"
+                            if lang == 'fa':
+                                response_text = f"✅ حذف شد: {uid}"
+                            else:
+                                response_text = f"✅ Deleted: {uid}"
                         else:
-                            response_text = f"❌ Cannot delete: {uid}"
+                            if lang == 'fa':
+                                response_text = f"❌ قابل حذف نیست: {uid}"
+                            else:
+                                response_text = f"❌ Cannot delete: {uid}"
 
                 elif command == "/stats":
-                    response_text = (
-                        f"📊 SulgX Panel Stats\n"
-                        f"🕒 Uptime: {uptime()}\n"
-                        f"🔗 Conns: {len(connections)}\n"
-                        f"📦 Traffic: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
-                        f"📡 Requests: {stats['total_requests']}\n"
-                        f"❌ Errors: {stats['total_errors']}"
-                    )
+                    if lang == 'fa':
+                        response_text = (
+                            f"📊 آمار پنل SulgX:\n"
+                            f"🕒 آپ‌تایم: {uptime()}\n"
+                            f"🔗 اتصالات: {len(connections)}\n"
+                            f"📦 ترافیک: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
+                            f"📡 درخواست‌ها: {stats['total_requests']}\n"
+                            f"❌ خطاها: {stats['total_errors']}"
+                        )
+                    else:
+                        response_text = (
+                            f"📊 SulgX Panel Stats\n"
+                            f"🕒 Uptime: {uptime()}\n"
+                            f"🔗 Conns: {len(connections)}\n"
+                            f"📦 Traffic: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
+                            f"📡 Requests: {stats['total_requests']}\n"
+                            f"❌ Errors: {stats['total_errors']}"
+                        )
+
+                elif command == "/setlang" and len(parts) > 1:
+                    new_lang = parts[1]
+                    if new_lang in ("fa", "en"):
+                        await db_execute(
+                            "INSERT OR REPLACE INTO settings (key, value) VALUES ('telegram_lang', ?)",
+                            "INSERT INTO settings (key, value) VALUES ('telegram_lang', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
+                            (new_lang,)
+                        )
+                        if new_lang == "fa":
+                            response_text = "✅ زبان روی فارسی تنظیم شد"
+                        else:
+                            response_text = "✅ Language set to English"
+                    else:
+                        if lang == 'fa':
+                            response_text = "❌ زبان ناشناخته. استفاده کنید: /setlang fa یا /setlang en"
+                        else:
+                            response_text = "❌ Unknown language. Use: /setlang fa or /setlang en"
 
                 else:
-                    response_text = "❌ Unknown command\nUse /help for available commands"
+                    if lang == 'fa':
+                        response_text = "❌ دستور ناشناخته\nاز /help برای راهنمایی استفاده کنید"
+                    else:
+                        response_text = "❌ Unknown command\nUse /help for available commands"
 
                 # Send response
                 if response_text:
