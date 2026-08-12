@@ -116,6 +116,7 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                     fragment TEXT DEFAULT '',
                     config_url TEXT DEFAULT '',
                     custom_outbound_limit BIGINT DEFAULT 0,
+                    limit_bytes_outbound BIGINT DEFAULT 0,
                     outbound_expires_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
@@ -199,6 +200,7 @@ else:
                 fragment TEXT DEFAULT '',
                 config_url TEXT DEFAULT '',
                 custom_outbound_limit INTEGER DEFAULT 0,
+                limit_bytes_outbound INTEGER DEFAULT 0,
                 outbound_expires_at TEXT
             );
             CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
@@ -1463,9 +1465,9 @@ async def create_link_custom(request: Request, _=Depends(require_auth)):
     link_data["config_url"] = config_url
 
     await db_execute(
-        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
-        (uid, label, limit_bytes, int(body.get("max_connections", 0) or 0), datetime.now(timezone.utc).isoformat(), 1, expires_at, extra.get("custom_path", ""), extra.get("custom_sni", ""), extra.get("custom_host", ""), extra.get("custom_fp", "chrome"), body.get("color", "#39ff14"), extra.get("flag", ""), extra.get("fragment", "")),
+        "INSERT INTO links (uid, label, limit_bytes, limit_bytes_outbound, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, config_url) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO links (uid, label, limit_bytes, limit_bytes_outbound, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, config_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+        (uid, label, limit_bytes, limit_bytes, int(body.get("max_connections", 0) or 0), datetime.now(timezone.utc).isoformat(), 1, expires_at, extra.get("custom_path", ""), extra.get("custom_sni", ""), extra.get("custom_host", ""), extra.get("custom_fp", "chrome"), body.get("color", "#39ff14"), extra.get("flag", ""), extra.get("fragment", ""), config_url),
     )
 
     # Generate the VLESS link from the config URL
