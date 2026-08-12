@@ -113,7 +113,10 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                     custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome',
                     color TEXT DEFAULT '#39ff14',
                     flag TEXT DEFAULT '',
-                    fragment TEXT DEFAULT ''
+                    fragment TEXT DEFAULT '',
+                    config_url TEXT DEFAULT '',
+                    custom_outbound_limit BIGINT DEFAULT 0,
+                    outbound_expires_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
@@ -134,6 +137,18 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                 pass
             try:
                 await conn.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS fragment TEXT DEFAULT ''")
+            except Exception:
+                pass
+            try:
+                await conn.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS config_url TEXT DEFAULT ''")
+            except Exception:
+                pass
+            try:
+                await conn.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS custom_outbound_limit INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                await conn.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS outbound_expires_at TEXT")
             except Exception:
                 pass
 
@@ -181,7 +196,10 @@ else:
                 custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome',
                 color TEXT DEFAULT '#39ff14',
                 flag TEXT DEFAULT '',
-                fragment TEXT DEFAULT ''
+                fragment TEXT DEFAULT '',
+                config_url TEXT DEFAULT '',
+                custom_outbound_limit INTEGER DEFAULT 0,
+                outbound_expires_at TEXT
             );
             CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
@@ -547,6 +565,202 @@ async def auto_disable_expired_links():
         except Exception as e:
             logger.error(f"auto_disable_expired_links error: {e}", exc_info=True)
 
+
+
+async def telegram_bot_command(request: Request, _=Depends(require_auth)):
+    """Handle Telegram bot commands for config management.
+    
+    Commands:
+    /list - List all inbounds with their status
+    /enable <uid> - Enable an inbound
+    /disable <uid> - Disable an inbound
+    /delete <uid> - Delete an inbound
+    """
+    body = await request.json()
+    text = body.get("text", "")
+    if not text:
+        return {"ok": False, "detail": "No text provided"}
+    
+    # Parse command
+    parts = text.strip().split(" ")
+    command = parts[0].lower()
+    
+    # Initialize response
+    response = {"ok": False, "detail": "Unknown command"}
+    
+    if command == "/list":
+        # List all inbounds
+        async with LINKS_LOCK:
+            items = list(LINKS.values())
+        response = {
+            "ok": True,
+            "inbounds": [
+                {
+                    "uid": item["uid"],
+                    "label": item.get("label", ""),
+                    "active": item.get("active", 0),
+                    "limit_bytes": item.get("limit_bytes", 0),
+                    "used_bytes": item.get("used_bytes", 0),
+                    "expires_at": item.get("expires_at", ""),
+                }
+                for item in items
+            ]
+        }
+    
+    elif command == "/enable" and len(parts) > 1:
+        uid = parts[1]
+        async with LINKS_LOCK:
+            if uid in LINKS:
+                LINKS[uid]["active"] = 1
+                # Update in DB
+                await db_execute(
+                    "UPDATE links SET active = 1 WHERE uid = ?",
+                    "UPDATE links SET active = TRUE WHERE uid = $1",
+                    (uid,)
+                )
+                response = {"ok": True, "detail": f"Enabled {uid}"}
+            else:
+                response = {"ok": False, "detail": f"Inbound {uid} not found"}
+    
+    elif command == "/disable" and len(parts) > 1:
+        uid = parts[1]
+        async with LINKS_LOCK:
+            if uid in LINKS:
+                LINKS[uid]["active"] = 0
+                # Update in DB
+                await db_execute(
+                    "UPDATE links SET active = 0 WHERE uid = ?",
+                    "UPDATE links SET active = FALSE WHERE uid = $1",
+                    (uid,)
+                )
+                response = {"ok": True, "detail": f"Disabled {uid}"}
+            else:
+                response = {"ok": False, "detail": f"Inbound {uid} not found"}
+    
+    elif command == "/delete" and len(parts) > 1:
+        uid = parts[1]
+        async with LINKS_LOCK:
+            if uid in LINKS and LINKS[uid].get("label") != "This Server is Free":
+                # Delete from DB
+                await db_execute(
+                    "DELETE FROM links WHERE uid = ?",
+                    "DELETE FROM links WHERE uid = $1",
+                    (uid,)
+                )
+                LINKS.pop(uid, None)
+                # Close connections
+                await close_connections_for_link(uid)
+                response = {"ok": True, "detail": f"Deleted {uid}"}
+            else:
+                response = {"ok": False, "detail": f"Cannot delete default inbound"}
+    
+    else:
+        response = {"ok": False, "detail": "Unknown command or missing arguments"}
+    
+    return response
+
+
+@app.post("/api/telegram-bot")
+async def telegram_bot_webhook(request: Request):
+    """Telegram bot webhook for config management commands."""
+    body = await request.json()
+    message = body.get("message", {})
+    text = message.get("text", "")
+    chat_id = message.get("chat", {}).get("id", "")
+    
+    if not text:
+        return {"ok": True}
+    
+    # Process command
+    parts = text.strip().split(" ")
+    command = parts[0].lower()
+    
+    # Get bot token and chat id from settings
+    token_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'", "SELECT value FROM settings WHERE key = 'tg_bot_token'")
+    allowed_chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
+    
+    if not token_row or not token_row["value"]:
+        return {"ok": False, "detail": "Bot token not configured"}
+    
+    # Verify this is from an allowed chat
+    if allowed_chat_row and str(allowed_chat_row["value"]) != str(chat_id):
+        return {"ok": False, "detail": "Unauthorized"}
+    
+    response_text = ""
+    
+    if command == "/list":
+        async with LINKS_LOCK:
+            items = list(LINKS.values())
+        response_text = "📋 Inbounds:\n"
+        for item in items:
+            status = "✅" if item.get("active") else "❌"
+            limit = item.get("limit_bytes", 0)
+            used = item.get("used_bytes", 0)
+            limit_str = "∞" if limit == 0 else f"{used/(1024**3):.1f}/{limit/(1024**3):.1f}GB"
+            response_text += f"{status} {item.get('label','')} - {item['uid'][:8]}... - {limit_str}\n"
+    
+    elif command == "/enable" and len(parts) > 1:
+        uid = parts[1]
+        async with LINKS_LOCK:
+            if uid in LINKS:
+                LINKS[uid]["active"] = 1
+                await db_execute(
+                    "UPDATE links SET active = 1 WHERE uid = ?",
+                    "UPDATE links SET active = TRUE WHERE uid = $1",
+                    (uid,)
+                )
+                response_text = f"✅ Enabled {uid}"
+            else:
+                response_text = f"❌ Inbound {uid} not found"
+    
+    elif command == "/disable" and len(parts) > 1:
+        uid = parts[1]
+        async with LINKS_LOCK:
+            if uid in LINKS:
+                LINKS[uid]["active"] = 0
+                await db_execute(
+                    "UPDATE links SET active = 0 WHERE uid = ?",
+                    "UPDATE links SET active = FALSE WHERE uid = $1",
+                    (uid,)
+                )
+                await close_connections_for_link(uid)
+                response_text = f"✅ Disabled {uid}"
+            else:
+                response_text = f"❌ Inbound {uid} not found"
+    
+    elif command == "/delete" and len(parts) > 1:
+        uid = parts[1]
+        async with LINKS_LOCK:
+            if uid in LINKS and LINKS[uid].get("label") != "This Server is Free":
+                await db_execute(
+                    "DELETE FROM links WHERE uid = ?",
+                    "DELETE FROM links WHERE uid = $1",
+                    (uid,)
+                )
+                LINKS.pop(uid, None)
+                await close_connections_for_link(uid)
+                response_text = f"✅ Deleted {uid}"
+            else:
+                response_text = f"❌ Cannot delete default inbound"
+    
+    elif command in ("/help", "/start"):
+        response_text = "🤖 SulgX Panel Bot\n\nCommands:\n/list - List all inbounds\n/enable <uid> - Enable inbound\n/disable <uid> - Disable inbound\n/delete <uid> - Delete inbound\n/help - Show this help"
+    
+    else:
+        response_text = "❌ Unknown command\nUse /help for available commands"
+    
+    # Send response
+    if response_text:
+        url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(url, json={"chat_id": chat_id, "text": response_text})
+        except Exception:
+            pass
+    
+    return {"ok": True, "response": response_text}
+
+
 async def telegram_reporter():
     while True:
         interval_hours = 1
@@ -617,13 +831,41 @@ def generate_vless_link_from_config(config_url: str, uid: str, remark: str = "Su
     """Generate a VLESS link from a custom config URL with all its parameters.
     The config_url should contain all the query parameters of a VLESS connection.
     The fragment (after #) is used as the remark.
+    
+    IMPORTANT: Uses the address from the config URL, not the panel domain.
+    This ensures traffic goes to the actual server specified in the config.
     """
-    cache_key = f"{uid}:{remark}:{address}:{json.dumps(extra) if extra else ''}"
+    parsed = parse_config_url(config_url)
+
+    # Extract the real address from the config URL (e.g., 104.21.23.102:443)
+    # The config URL format: vless://UUID@IP:PORT?params#fragment
+    addr = address  # If caller overrides, use that
+    if not addr:
+        # Parse from config URL
+        try:
+            # Remove the "vless://" prefix
+            url_body = config_url.replace("vless://", "", 1)
+            # Split on @ to separate UUID from address:port
+            at_pos = url_body.find("@")
+            if at_pos > 0:
+                addr_part = url_body[at_pos+1:].split("?")[0].split("#")[0]
+                # addr_part could be "104.21.23.102:443" or just "104.21.23.102"
+                if ":" in addr_part:
+                    # Split address and port
+                    addr_port = addr_part.rsplit(":", 1)
+                    addr = addr_port[0]
+                else:
+                    addr = addr_part
+            else:
+                addr = get_domain()
+        except Exception:
+            addr = get_domain()
+
+    cache_key = f"{uid}:{remark}:{addr}:{json.dumps(extra) if extra else ''}"
     if cache_key in link_cache and link_cache[cache_key]["expires"] > time.time():
         return link_cache[cache_key]["link"]
+
     domain = get_domain()
-    addr = address if address else domain
-    parsed = parse_config_url(config_url)
     params = {}
     for k, v in parsed.items():
         params[k] = v
@@ -1366,6 +1608,7 @@ async def list_links(_=Depends(require_auth)):
             "flag": row.get("flag", ""),
             "fragment": row.get("fragment", ""),
             "current_connections": await count_connections_for_link(uid),
+            "config_url": row.get("config_url", ""),
             "vless_link": generate_vless_link(uid, remark=f"SulgX-{row['label']}", extra=extra),
         })
     return {"links": result}
@@ -3127,6 +3370,7 @@ function renderLinks(links){
               <button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button>
               <button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button>
               <button class="act-btn act-sub" title="Copy Subscription Link" onclick="copySubLink('${l.uuid}')">📎 Sub</button>
+              ${l.config_url ? `<button class="act-btn act-copy" title="Copy Custom Config" onclick="cpLink('${esc(l.config_url)}')">📄</button>` : ''}
             `}
           </div>
         </div>
